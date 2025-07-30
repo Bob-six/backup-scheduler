@@ -169,9 +169,13 @@ func configureBackup() {
 		fmt.Print("Enter path to Google OAuth credentials JSON: ")
 		scanner.Scan()
 		googleCreds = scanner.Text()
-		fmt.Print("Enter Google Drive folder ID: ")
-		scanner.Scan()
-		googleFolderID = scanner.Text()
+
+		folderID, err := createGoogleDriveFolder(googleCreds)
+		if err != nil {
+			fmt.Printf("Failed to create Google Drive folder: %v\n", err)
+			return
+		}
+		googleFolderID = folderID
 
 	default:
 		fmt.Println("Invalid choice. Exiting.")
@@ -227,6 +231,32 @@ func configureBackup() {
 	}
 
 	fmt.Println("Backup configured successfully.")
+}
+
+func createGoogleDriveFolder(credsPath string) (string, error) {
+	ctx := context.Background()
+	b, err := os.ReadFile(credsPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read credentials: %v", err)
+	}
+	config, err := google.JWTConfigFromJSON(b, drive.DriveScope)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse credentials: %v", err)
+	}
+	client := config.Client(ctx)
+	srv, err := drive.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		return "", fmt.Errorf("failed to create drive service: %v", err)
+	}
+	folder := &drive.File{
+		Name:     "Backups_" + time.Now().Format("2006-01-02_15-04-05"),
+		MimeType: "application/vnd.google-apps.folder",
+	}
+	createdFolder, err := srv.Files.Create(folder).Do()
+	if err != nil {
+		return "", fmt.Errorf("failed to create folder: %v", err)
+	}
+	return createdFolder.Id, nil
 }
 
 func performBackup() {
