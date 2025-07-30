@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,18 +12,32 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"golang.org/x/oauth2/google"
+	"google.golang.org/api/drive/v3"
+	"google.golang.org/api/option"
 )
 
 type Config struct {
-	Integrations []string `json:"integrations"`
-	PostgresURL  string   `json:"postgres_url,omitempty"`
-	FolderPath   string   `json:"folder_path,omitempty"`
-	Frequency    string   `json:"frequency"`
-	Storage      string   `json:"storage"`
-	LocalPath    string   `json:"local_path,omitempty"`
-	BotToken     string   `json:"bot_token,omitempty"`
-	ChannelID    int64    `json:"channel_id,omitempty"`
+	Integrations   []string `json:"integrations"`
+	PostgresURL    string   `json:"postgres_url,omitempty"`
+	FolderPath     string   `json:"folder_path,omitempty"`
+	Frequency      string   `json:"frequency"`
+	Storage        string   `json:"storage"`
+	LocalPath      string   `json:"local_path,omitempty"`
+	BotToken       string   `json:"bot_token,omitempty"`
+	ChannelID      int64    `json:"channel_id,omitempty"`
+	S3Bucket       string   `json:"s3_bucket,omitempty"`
+	S3Region       string   `json:"s3_region,omitempty"`
+	S3AccessKey    string   `json:"s3_access_key,omitempty"`
+	S3SecretKey    string   `json:"s3_secret_key,omitempty"`
+	GoogleCreds    string   `json:"google_creds,omitempty"`
+	GoogleFolderID string   `json:"google_folder_id,omitempty"`
 }
 
 func main() {
@@ -101,13 +116,16 @@ func configureBackup() {
 	fmt.Println("Where do you want to store the backups?")
 	fmt.Println("1. Local Drive")
 	fmt.Println("2. Telegram Bot Channel")
-	fmt.Print("Enter your choice (1-2): ")
+	fmt.Println("3. AWS S3")
+	fmt.Println("4. Google Drive")
+	fmt.Print("Enter your choice (1-4): ")
+
 	scanner.Scan()
 	storageChoice := scanner.Text()
 
-	var storage, localPath, botToken string
-	var channelID int64
+	var storage, localPath, botToken, s3Bucket, s3Region, s3AccessKey, s3SecretKey, googleCreds, googleFolderID string
 
+	var channelID int64
 	switch storageChoice {
 	case "1":
 		storage = "local"
@@ -130,20 +148,49 @@ func configureBackup() {
 			os.Exit(1)
 		}
 
+	case "3":
+		storage = "s3"
+		fmt.Print("Enter S3 Bucket Name: ")
+		scanner.Scan()
+		s3Bucket = scanner.Text()
+		fmt.Print("Enter S3 Region: ")
+		scanner.Scan()
+		s3Region = scanner.Text()
+		fmt.Print("Enter S3 Access Key: ")
+		scanner.Scan()
+		s3AccessKey = scanner.Text()
+		fmt.Print("Enter S3 Secret Key: ")
+		scanner.Scan()
+		s3SecretKey = scanner.Text()
+	case "4":
+		storage = "google_drive"
+		fmt.Print("Enter path to Google OAuth credentials JSON: ")
+		scanner.Scan()
+		googleCreds = scanner.Text()
+		fmt.Print("Enter Google Drive folder ID: ")
+		scanner.Scan()
+		googleFolderID = scanner.Text()
+
 	default:
 		fmt.Println("Invalid choice. Exiting.")
 		return
 	}
 
 	config := Config{
-		Integrations: integrations,
-		PostgresURL:  postgresURL,
-		FolderPath:   folderPath,
-		Frequency:    frequency,
-		Storage:      storage,
-		LocalPath:    localPath,
-		BotToken:     botToken,
-		ChannelID:    channelID,
+		Integrations:   integrations,
+		PostgresURL:    postgresURL,
+		FolderPath:     folderPath,
+		Frequency:      frequency,
+		Storage:        storage,
+		LocalPath:      localPath,
+		BotToken:       botToken,
+		ChannelID:      channelID,
+		S3Bucket:       s3Bucket,
+		S3Region:       s3Region,
+		S3AccessKey:    s3AccessKey,
+		S3SecretKey:    s3SecretKey,
+		GoogleCreds:    googleCreds,
+		GoogleFolderID: googleFolderID,
 	}
 
 	if err := saveConfig(config); err != nil {
@@ -200,8 +247,16 @@ func performBackup() {
 			if err := storeTelegram(filename, config.BotToken, config.ChannelID); err != nil {
 				fmt.Printf("Error uploading backup to Telegram: %v\n", err)
 			}
+		} else if config.Storage == "s3" {
+			if err := storeS3(filename, config.S3Bucket, config.S3Region, config.S3AccessKey, config.S3SecretKey); err != nil {
+				fmt.Printf("Error uploading backup to S3: %v\n", err)
+			}
+		} else if config.Storage == "google_drive" {
+			if err := storeGoogleDrive(filename, config.GoogleCreds, config.GoogleFolderID); err != nil {
+				fmt.Printf("Error uploading backup to Google Drive: %v\n", err)
+			}
 		}
-		os.Remove(filename) // Clean up temporary file
+		os.Remove(filename)
 	}
 }
 
@@ -289,4 +344,60 @@ func storeTelegram(filename, botToken string, channelID int64) error {
 	})
 	_, err = bot.Send(doc)
 	return err
+}
+
+func storeGoogleDrive(filename, credsPath, folderID string) error {
+	ctx := context.Background()
+	b, err := os.ReadFile(credsPath)
+	if err != nil {
+		return fmt.Errorf("failed to read credentials: %v", err)
+	}
+	config, err := google.JWTConfigFromJSON(b, drive.DriveScope)
+	if err != nil {
+		return fmt.Errorf("failed to parse credentials: %v", err)
+	}
+	client := config.Client(ctx)
+	srv, err := drive.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		return fmt.Errorf("failed to create drive service: %v", err)
+	}
+	file, err := os.Open(filename)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %v", err)
+	}
+	defer file.Close()
+	f := &drive.File{
+		Name:    filepath.Base(filename),
+		Parents: []string{folderID},
+	}
+	_, err = srv.Files.Create(f).Media(file).Do()
+	if err != nil {
+		return fmt.Errorf("failed to upload to Google Drive: %v", err)
+	}
+	return nil
+}
+
+func storeS3(filename, bucket, region, accessKey, secretKey string) error {
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion(region),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to load AWS config: %v", err)
+	}
+	uploader := manager.NewUploader(s3.NewFromConfig(cfg))
+	file, err := os.Open(filename)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %v", err)
+	}
+	defer file.Close()
+	_, err = uploader.Upload(context.TODO(), &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(filepath.Base(filename)),
+		Body:   file,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to upload to S3: %v", err)
+	}
+	return nil
 }
