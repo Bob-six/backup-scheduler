@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
 
@@ -38,6 +39,7 @@ type Config struct {
 	S3SecretKey    string   `json:"s3_secret_key,omitempty"`
 	GoogleCreds    string   `json:"google_creds,omitempty"`
 	GoogleFolderID string   `json:"google_folder_id,omitempty"`
+	MaxBackups     int      `json:"max_backups"`
 }
 
 func main() {
@@ -175,6 +177,19 @@ func configureBackup() {
 		fmt.Println("Invalid choice. Exiting.")
 		return
 	}
+	var backupStorage = -1
+
+	if storage != "telegram" {
+		fmt.Print("Enter the number of backups to keep (-1 to keep all): ")
+		scanner.Scan()
+		maxBackupsStr := scanner.Text()
+		maxBackups, err := strconv.Atoi(maxBackupsStr)
+		if err != nil || (maxBackups < -1 || maxBackups == 0) {
+			fmt.Println("Invalid number. Use -1 or a positive integer.")
+			return
+		}
+		backupStorage = maxBackups
+	}
 
 	config := Config{
 		Integrations:   integrations,
@@ -191,6 +206,7 @@ func configureBackup() {
 		S3SecretKey:    s3SecretKey,
 		GoogleCreds:    googleCreds,
 		GoogleFolderID: googleFolderID,
+		MaxBackups:     backupStorage,
 	}
 
 	if err := saveConfig(config); err != nil {
@@ -258,6 +274,13 @@ func performBackup() {
 		}
 		os.Remove(filename)
 	}
+
+	if config.Storage != "telegram" && config.MaxBackups > 0 {
+		if err := cleanupBackups(config); err != nil {
+			fmt.Printf("Error cleaning up backups: %v\n", err)
+		}
+	}
+
 }
 
 func getConfigPath() string {
@@ -398,6 +421,109 @@ func storeS3(filename, bucket, region, accessKey, secretKey string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("failed to upload to S3: %v", err)
+	}
+	return nil
+}
+
+func cleanupBackups(config Config) error {
+
+	switch config.Storage {
+	case "local":
+		return cleanupLocalBackups(config.LocalPath, config.MaxBackups)
+	case "s3":
+		return cleanupS3Backups(config.S3Bucket, config.S3Region, config.S3AccessKey, config.S3SecretKey, config.MaxBackups)
+	case "google_drive":
+		return cleanupGoogleDriveBackups(config.GoogleCreds, config.GoogleFolderID, config.MaxBackups)
+	default:
+		return fmt.Errorf("unsupported storage for cleanup: %s", config.Storage)
+	}
+}
+
+func cleanupLocalBackups(path string, maxBackups int) error {
+	files, err := filepath.Glob(filepath.Join(path, "backup_*"))
+	if err != nil {
+		return err
+	}
+	if len(files) <= maxBackups {
+		return nil
+	}
+	sort.Slice(files, func(i, j int) bool {
+		fi, _ := os.Stat(files[i])
+		fj, _ := os.Stat(files[j])
+		return fi.ModTime().Before(fj.ModTime())
+	})
+	for _, file := range files[:len(files)-maxBackups] {
+		if err := os.Remove(file); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cleanupS3Backups(bucket, region, accessKey, secretKey string, maxBackups int) error {
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion(region),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
+	)
+	if err != nil {
+		return err
+	}
+	s3Client := s3.NewFromConfig(cfg)
+	resp, err := s3Client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+		Prefix: aws.String("backup_"),
+	})
+	if err != nil {
+		return err
+	}
+	objects := resp.Contents
+	if len(objects) <= maxBackups {
+		return nil
+	}
+	sort.Slice(objects, func(i, j int) bool {
+		return objects[i].LastModified.Before(*objects[j].LastModified)
+	})
+	for _, obj := range objects[:len(objects)-maxBackups] {
+		_, err := s3Client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    obj.Key,
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cleanupGoogleDriveBackups(credsPath, folderID string, maxBackups int) error {
+	ctx := context.Background()
+	b, err := os.ReadFile(credsPath)
+	if err != nil {
+		return err
+	}
+	config, err := google.JWTConfigFromJSON(b, drive.DriveScope)
+	if err != nil {
+		return err
+	}
+	client := config.Client(ctx)
+	srv, err := drive.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		return err
+	}
+	query := fmt.Sprintf("'%s' in parents and name contains 'backup_'", folderID)
+	fileList, err := srv.Files.List().Q(query).OrderBy("createdTime").Do()
+	if err != nil {
+		return err
+	}
+	files := fileList.Files
+	if len(files) <= maxBackups {
+		return nil
+	}
+	for _, file := range files[:len(files)-maxBackups] {
+		err := srv.Files.Delete(file.Id).Do()
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
